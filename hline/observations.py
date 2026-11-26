@@ -34,6 +34,26 @@ class ObservationStore:
         self.sequence = 0
 
     @staticmethod
+    def prepare_directory_change(current_store, destination, *, active_segment=False):
+        """Construct a new store only if the transition is unambiguous.
+
+        Existing files are NOT moved. Any pending checkpoint in either folder
+        requires explicit operator recovery before switching destinations.
+        """
+        dest = Path(destination).expanduser().resolve()
+        old = current_store.root.expanduser().resolve()
+        if dest == old:
+            return current_store
+        if current_store.checkpoint.exists() and not active_segment:
+            raise RuntimeError('The current folder has a recovery checkpoint; recover it before switching folders')
+        # Do not reuse or overwrite an existing checkpoint in the new folder.
+        if (dest / 'recovery_checkpoint.npz').exists():
+            raise RuntimeError('The destination has an existing recovery checkpoint; recover it first')
+        # No active session is carried across folders. A fresh session avoids
+        # filename and sequence-number collisions with existing observations.
+        return ObservationStore(root=dest)
+
+    @staticmethod
     def _atomic_npz(destination, spectrum, metadata):
         """Write, sync, then replace. Never delete an older good file on failure."""
         destination = Path(destination)

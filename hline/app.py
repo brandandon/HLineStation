@@ -264,7 +264,13 @@ class MainWindow(QMainWindow):
         c = dict(self.cfg)
         if self.demo and c["source"] == "simulator":
             c["source"] = self._saved_source  # --demo is for this session only
-        config.save(c)
+        try:
+            config.save(c)
+            return True
+        except (OSError, TypeError, ValueError) as exc:
+            self.last_save_error = f"Settings could not be saved: {exc}"
+            QMessageBox.warning(self, APP_NAME, self.last_save_error)
+            return False
 
     # ------------------------------------------------------ observation safety
     def _observation_pointing(self):
@@ -677,14 +683,40 @@ class MainWindow(QMainWindow):
                                        "dish_az", "dish_el", "integration_s"))
             rx_keys = ("source", "device_index", "center_mhz", "sample_rate", "gain", "ppm", "bias_tee", "nfft", "ffts_per_block")
             restart_receiver = self.rx is not None and any(old.get(k) != new_cfg.get(k) for k in rx_keys)
+            storage_changed = observation_dir(old.get('observation_dir')) != observation_dir(new_cfg.get('observation_dir'))
+            candidate_store = self.observations
+            if storage_changed:
+                # Preflight before stopping the SDR or changing any saved setting.
+                try:
+                    candidate_store = ObservationStore.prepare_directory_change(
+                        self.observations, observation_dir(new_cfg.get('observation_dir')),
+                        active_segment=self.integ.avg is not None)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    QMessageBox.warning(self, APP_NAME, f"Cannot change observation folder: {exc}")
+                    return
+                # An active segment must finish in its original directory.
+                restart_receiver = self.rx is not None
             if restart_receiver:
                 # Stop and invalidate old queued signals before applying new settings.
                 if not self.stop_rx():
                     return
-            elif acquisition_changed and not self._reset_segment("settings_change"):
+            elif (acquisition_changed or storage_changed) and not self._reset_segment("settings_change"):
                 return
+            if storage_changed and self.observations.checkpoint.exists():
+                QMessageBox.warning(self, APP_NAME,
+                                    "The old observation folder still has a recovery checkpoint. "
+                                    "Resolve it before changing folders.")
+                return
+            # Settings must be persisted BEFORE changing the active store.
+            # If writing fails, the original configuration and storage stay in use.
             self.cfg = new_cfg
-            self._save()
+            if not self._save():
+                self.cfg = old
+                return
+            self.observations = candidate_store
+            if storage_changed:
+                self.statusBar().showMessage(
+                    f"New observations will be saved to {self.observations.root}; existing files were not moved", 15000)
             self.setWindowTitle(f"{APP_NAME} – {self.cfg['site_name']}")
             for sp, k in ((self.el_spin, "dish_el"), (self.az_spin, "dish_az")):
                 sp.blockSignals(True)

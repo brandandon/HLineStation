@@ -9,7 +9,8 @@ import unittest
 HAS_QT = importlib.util.find_spec('PySide6') is not None
 if HAS_QT:
     os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
-    from PySide6.QtCore import QCoreApplication, QObject, Signal, Qt
+    from PySide6.QtCore import QObject, Signal, Qt
+    from PySide6.QtWidgets import QApplication
     from hline.app import MainWindow
 
 
@@ -21,7 +22,7 @@ class ReceiverLifecycleQtTests(unittest.TestCase):
             status = Signal(str)
 
     def test_old_generation_queued_events_cannot_touch_new_receiver(self):
-        app = QCoreApplication.instance() or QCoreApplication([])
+        app = QApplication.instance() or QApplication([])
 
         class State:
             _rx_generation = 4
@@ -45,7 +46,7 @@ class ReceiverLifecycleQtTests(unittest.TestCase):
         # Stop/restart before processing any queued events.
         state._rx_generation = 6
         state.rx = object()
-        QCoreApplication.processEvents()
+        QApplication.processEvents()
         self.assertEqual(state.accepted, [])
 
         current = self.Worker()
@@ -53,12 +54,12 @@ class ReceiverLifecycleQtTests(unittest.TestCase):
             lambda value: MainWindow._receiver_event(state, 6, state.on_spectrum, value),
             Qt.ConnectionType.QueuedConnection)
         current.spectrum.emit(10)
-        QCoreApplication.processEvents()
+        QApplication.processEvents()
         self.assertEqual(state.accepted, [('spectrum', 10)])
 
         state.rx = None
         current.spectrum.emit(11)
-        QCoreApplication.processEvents()
+        QApplication.processEvents()
         self.assertEqual(state.accepted, [('spectrum', 10)])
 
 

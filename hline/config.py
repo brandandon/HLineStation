@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import tempfile
 
 from .paths import user_dir
 
@@ -99,8 +100,21 @@ def load() -> dict:
 
 
 def save(cfg: dict):
+    """Atomically save preferences. Raise on failure so the UI can warn.
+
+    The previous settings.json remains intact if serialization, fsync, or
+    replacement fails. No exception is hidden from the caller.
+    """
+    target = _path()
+    parent = os.path.dirname(target)
+    os.makedirs(parent, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.hline-settings-', suffix='.tmp', dir=parent)
     try:
-        with open(_path(), "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
-    except Exception as e:  # pragma: no cover
-        print("Could not save settings:", e)
+        with os.fdopen(fd, 'w', encoding='utf-8') as output:
+            json.dump(cfg, output, indent=2, allow_nan=False)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)

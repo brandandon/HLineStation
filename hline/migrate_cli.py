@@ -16,30 +16,31 @@ from pathlib import Path
 from .storage_migration import copy_legacy_observations, migration_preflight
 
 
-def migration_preview(source, destination):
+def migration_preview(source, destination, *, calibration_source=None):
     src, dest = Path(source).expanduser().resolve(), Path(destination).expanduser().resolve()
     if not src.is_dir():
         raise FileNotFoundError(src)
     if src == dest or src in dest.parents or dest in src.parents:
         raise ValueError('Source and destination directories must not overlap')
-    plan = migration_preflight(src, dest)
+    plan = migration_preflight(src, dest, calibration_source=calibration_source)
     # This summary is compatible with the preview-only CLI used in Patch 03.
     return {'source': str(src), 'destination': str(dest),
             'copy': plan['copy'], 'identical': plan['identical'],
             'conflicts': plan['conflicts'], 'pending_checkpoint': plan['pending_checkpoint'],
             'total_source_observations': len(list(src.glob('*.npz'))) - int(plan['pending_checkpoint']),
             'recovery_sidecars': len(list(src.glob('*.recovery.json'))),
-            'calibration_archives': len(list((src/'calibrations').glob('*.npz'))) if (src/'calibrations').is_dir() else 0}
+            'calibration_archives': len([p for p in plan['copy'] + plan['identical'] + plan['conflicts'] if p.startswith('calibrations/')])}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--source', required=True, help='Original observations folder')
     parser.add_argument('--destination', required=True, help='New observations folder')
+    parser.add_argument('--calibration-source', default=None, help='Optional legacy application-data calibrations folder')
     parser.add_argument('--apply', action='store_true', help='Explicitly approve copying after preview')
     args = parser.parse_args(argv)
     try:
-        plan = migration_preview(args.source, args.destination)
+        plan = migration_preview(args.source, args.destination, calibration_source=args.calibration_source)
         print('Source:', plan['source'])
         print('Destination:', plan['destination'])
         print('Copy candidates:', len(plan['copy']))
@@ -55,7 +56,7 @@ def main(argv=None):
         if not args.apply:
             print('PREVIEW ONLY: Nothing changed. Rerun with --apply to copy and verify files.')
             return 0
-        count = copy_legacy_observations(plan['source'], plan['destination'])
+        count = copy_legacy_observations(plan['source'], plan['destination'], calibration_source=args.calibration_source)
         print(f'Migration complete: {count} newly copied, all originals retained.')
         return 0
     except (OSError, ValueError, RuntimeError) as exc:

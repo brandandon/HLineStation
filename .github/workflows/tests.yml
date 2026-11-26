@@ -32,3 +32,28 @@ jobs:
 
       - name: Run tests
         run: python -m pytest -q
+
+  qt-lifecycle:
+    name: Mandatory Qt lifecycle - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Install GUI dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+      - name: Verify Qt imports
+        run: python -c "import PySide6, pyqtgraph, ephem, erfa; from hline.app import MainWindow; print('Qt application imports OK')"
+      - name: Run mandatory Qt regression tests
+        run: python -m pytest -q tests/test_patch04_qt.py tests/test_patch05_qt.py
