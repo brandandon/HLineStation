@@ -90,6 +90,7 @@ class MainWindow(QMainWindow):
         self.segment_pointing = {}
         self._last_checkpoint_count = 0
         self.rx = None
+        self._rx_generation = 0  # Invalidates queued signals from retired receivers.
         self._rx_ended_reason = None
         self._rx_end_unexpected = False
         self._receiver_stop_in_progress = False
@@ -326,30 +327,47 @@ class MainWindow(QMainWindow):
         s = self.state
         return s.get("ra", 0.0), s.get("dec", 0.0), s.get("corr", 0.0)
 
+    def _receiver_event(self, generation, method, *args):
+        """Ignore queued Qt signals from a superseded or stopped receiver."""
+        if generation != self._rx_generation or self.rx is None:
+            return
+        return method(*args)
+
     def start_rx(self):
         if getattr(self, "_recovery_blocked", False):
-            return
+            return False
         if not self.stop_rx():
-            return
+            return False
         if not self._reset_segment("receiver_restart"):
-            return
+            return False
         self.rx_error = ""
+        self._rx_ended_reason = None
+        self._rx_end_unexpected = False
+        self._rx_generation += 1
+        generation = self._rx_generation
         if self.cfg["source"] == "simulator":
             self.rx = SimulatorThread(self._rx_cfg(), self._pointing, self)
         else:
             self.rx = RtlSdrThread(self._rx_cfg(), self)
-        self.rx.spectrum.connect(self.on_spectrum)
-        self.rx.status.connect(self.on_status)
-        self.rx.opened.connect(self.on_opened)
-        self.rx.acquisitionEnded.connect(self.on_acquisition_ended)
-        self.rx.finished.connect(self.on_rx_finished)
-        self.rx.bgProgress.connect(self.on_bg_progress)
-        self.rx.bgDone.connect(self.on_bg_done)
+        # Queued signals already in Qt's event loop may fire after stop/wait.
+        # Each callback must verify the worker's generation before mutating state.
+        for signal, handler in (
+            (self.rx.spectrum, self.on_spectrum),
+            (self.rx.status, self.on_status),
+            (self.rx.opened, self.on_opened),
+            (self.rx.acquisitionEnded, self.on_acquisition_ended),
+            (self.rx.bgProgress, self.on_bg_progress),
+            (self.rx.bgDone, self.on_bg_done),
+            (self.rx.finished, self.on_rx_finished),
+        ):
+            signal.connect(lambda *args, _generation=generation, _handler=handler:
+                           self._receiver_event(_generation, _handler, *args))
         self.bg_progress = None
         self.act_autobg.setEnabled(True)
         self.rx.start()
         self.act_rx.setChecked(True)
         self.act_rx.setText("■ Stop")
+        return True
 
     def stop_rx(self):
         if self.rx is not None:
@@ -360,8 +378,13 @@ class MainWindow(QMainWindow):
                                     "do not disconnect the SDR. Try stopping again.")
                 self._receiver_stop_in_progress = False
                 return False
+            # Advance generation before retiring the receiver: queued signals
+            # must never append data to the next empty observation segment.
+            self._rx_generation += 1
             self.rx = None
             self._receiver_stop_in_progress = False
+            self._rx_ended_reason = None
+            self._rx_end_unexpected = False
         self.act_rx.setChecked(False)
         self.act_rx.setText("▶ Start")
         if not self._save_segment("receiver_stop"):
@@ -375,14 +398,12 @@ class MainWindow(QMainWindow):
 
     def toggle_rx(self):
         if self.rx is not None and self.rx.isRunning():
-            self.stop_rx()
-            self.statusBar().showMessage("Stopped")
+            # Do not conceal a failed save with a false "Stopped" message.
+            self.stop_rx()  # _save_segment owns success/failure messaging.
         else:
             self.start_rx()
 
     def on_acquisition_ended(self, reason, unexpected):
-        # The signal is queued to the GUI thread. The finished handler finalizes
-        # after any previously queued spectrum samples have been processed.
         self._rx_ended_reason = str(reason)
         self._rx_end_unexpected = bool(unexpected)
 
@@ -397,7 +418,6 @@ class MainWindow(QMainWindow):
         unexpected = self._rx_end_unexpected or reason != "operator_stop"
         self._rx_ended_reason = None
         self._rx_end_unexpected = False
-        # Save first; retain the accumulated average and checkpoint on failure.
         if not self._save_segment("receiver_interrupted" if unexpected else "receiver_finished"):
             self.statusBar().showMessage("Receiver stopped; unsaved observation retained for recovery", 15000)
             return
@@ -406,15 +426,26 @@ class MainWindow(QMainWindow):
         self.segment_pointing = self._observation_pointing()
         self._last_checkpoint_count = 0
         self.dirty = True
+        # Invalidate callbacks still queued from this completed worker.
+        self._rx_generation += 1
         if unexpected:
             self.statusBar().showMessage("Receiver stopped unexpectedly; observation saved. Restart manually.", 15000)
         self.rx = None
 
     def on_spectrum(self, p, dt):
+        # Never average a spectrum against different FFT metadata.  Refuse
+        # malformed blocks rather than creating another one-block segment.
+        p = np.asarray(p)
+        expected = int(self.cfg["nfft"])
+        if p.ndim != 1 or p.size != expected or not np.all(np.isfinite(p)) or np.any(p < 0):
+            self.statusBar().showMessage("Rejected invalid receiver spectrum (FFT/data mismatch)", 12000)
+            return
+        if not np.isfinite(dt) or dt <= 0:
+            self.statusBar().showMessage("Rejected receiver spectrum with invalid duration", 12000)
+            return
         if self.integ.avg is not None and self.integ.avg.shape != p.shape:
-            if not self._reset_segment("spectrum_shape_changed"):
-                self.stop_rx()
-                return
+            self.statusBar().showMessage("Rejected spectrum: observation FFT shape changed unexpectedly", 12000)
+            return
         self.integ.add(p, dt, float(self.cfg["integration_s"]))
         self.dirty = True
 
@@ -454,10 +485,18 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Previous average saved; new average started", 4000)
 
     def _bg_key(self):
-        return (float(self.cfg["center_mhz"]), float(self.cfg["sample_rate"]), float(self.cfg["nfft"]))
+        return (str(self.cfg["source"]), int(self.cfg.get("device_index", 0)),
+                float(self.cfg["center_mhz"]), int(self.cfg["nfft"]),
+                float(self.cfg["sample_rate"]), str(self.cfg.get("gain", "auto")),
+                int(self.cfg.get("ppm", 0)), bool(self.cfg.get("bias_tee", False)))
 
     def capture_background(self):
-        if self.integ.capture_background(self._bg_key()):
+        try:
+            captured = self.integ.capture_background(self._bg_key())
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, APP_NAME, f"Background calibration was not saved: {exc}")
+            return
+        if captured:
             self.statusBar().showMessage(
                 f"Background captured from {self.integ.effective_time(self.cfg['integration_s']):.0f} s of data", 5000)
             if self.mode_combo.currentData() in ("baseline", "raw"):
@@ -529,14 +568,22 @@ class MainWindow(QMainWindow):
         if psd is None:
             self.statusBar().showMessage("Auto background failed – no data", 6000)
         else:
-            self.integ.set_background(psd, self._bg_key())
+            try:
+                self.integ.set_background(psd, self._bg_key())
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(self, APP_NAME, f"Automatic background calibration was not saved: {exc}")
+                return
             if self.mode_combo.currentData() != "background+baseline":
                 self.mode_combo.setCurrentIndex(self.mode_combo.findData("background+baseline"))
             self.statusBar().showMessage("Auto background done – the receiver's shape is now divided out", 8000)
         self.dirty = True
 
     def clear_background(self):
-        self.integ.clear_background()
+        try:
+            self.integ.clear_background()
+        except OSError as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not remove background calibration: {exc}")
+            return
         self.statusBar().showMessage("Background cleared", 3000)
         self.dirty = True
 
@@ -548,12 +595,14 @@ class MainWindow(QMainWindow):
             acquisition_changed = any(old.get(k) != new_cfg.get(k) for k in
                                       ("source", "device_index", "center_mhz", "sample_rate", "gain", "ppm", "nfft",
                                        "dish_az", "dish_el", "integration_s"))
-            if acquisition_changed and not self._save_segment("settings_change"):
+            rx_keys = ("source", "device_index", "center_mhz", "sample_rate", "gain", "ppm", "bias_tee", "nfft", "ffts_per_block")
+            restart_receiver = self.rx is not None and any(old.get(k) != new_cfg.get(k) for k in rx_keys)
+            if restart_receiver:
+                # Stop and invalidate old queued signals before applying new settings.
+                if not self.stop_rx():
+                    return
+            elif acquisition_changed and not self._reset_segment("settings_change"):
                 return
-            if acquisition_changed:
-                self.integ.reset()
-                self.segment_started_utc = utc_stamp()
-                self._last_checkpoint_count = 0
             self.cfg = new_cfg
             self._save()
             self.setWindowTitle(f"{APP_NAME} – {self.cfg['site_name']}")
@@ -568,8 +617,7 @@ class MainWindow(QMainWindow):
             self.act_lock.setChecked(bool(self.cfg.get("y_fixed", False)))
             self.act_lock.blockSignals(False)
             self._db_center = None
-            rx_keys = ("source", "device_index", "center_mhz", "sample_rate", "gain", "ppm", "bias_tee", "nfft")
-            if any(old.get(k) != self.cfg.get(k) for k in rx_keys) and self.rx is not None:
+            if restart_receiver:
                 self.start_rx()
             if (old["dish_az"], old["dish_el"]) != (self.cfg["dish_az"], self.cfg["dish_el"]) and self.cfg["reset_on_repoint"]:
                 self._reset_segment("settings_pointing_change")
@@ -683,6 +731,8 @@ class MainWindow(QMainWindow):
             title += f"  (averaged {t:.0f} s)"
         if self.bg_progress is not None:
             title += f"   [measuring background… {self.bg_progress*100:.0f}%]"
+        elif res and res.get("baseline_failed"):
+            title += "   [baseline invalid – displaying raw spectrum; peaks disabled]"
         elif res and res.get("fallback"):
             title += "   [no background yet – press ★ Auto background]"
         if res and res.get("spikes"):

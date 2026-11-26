@@ -48,15 +48,64 @@ class ObservationStore:
                 os.unlink(tmp)
 
     @staticmethod
+    def _validate(power, metadata):
+        """Validate persisted observations without altering legacy v1 contents."""
+        if not isinstance(metadata, dict):
+            raise ValueError("Observation metadata must be a JSON object")
+        if metadata.get("schema_version") != SCHEMA_VERSION:
+            raise ValueError("Unsupported observation schema")
+        power = np.asarray(power)
+        if power.ndim != 1 or power.size == 0 or not np.issubdtype(power.dtype, np.number):
+            raise ValueError("Invalid observation power spectrum dimensions or type")
+        if not np.all(np.isfinite(power)) or np.any(power < 0):
+            raise ValueError("Observation spectrum contains nonfinite or negative power")
+        required = ("session_id", "reason", "synthetic", "settings", "pointing",
+                    "saved_utc", "started_utc", "spectrum_count",
+                    "elapsed_integration_s", "effective_integration_s")
+        missing = [key for key in required if key not in metadata]
+        if missing:
+            raise ValueError("Missing observation metadata: " + ", ".join(missing))
+        settings = metadata["settings"]
+        if not isinstance(settings, dict):
+            raise ValueError("Observation settings must be a JSON object")
+        for key in ("source", "center_mhz", "sample_rate", "nfft", "gain"):
+            if key not in settings or settings[key] is None:
+                raise ValueError(f"Missing receiver setting: {key}")
+        nfft = settings["nfft"]
+        if isinstance(nfft, bool) or not isinstance(nfft, int) or nfft <= 0:
+            raise ValueError("Invalid FFT size in observation metadata")
+        if power.size != nfft:
+            raise ValueError(f"FFT mismatch: {power.size} spectrum bins, metadata nfft={nfft}")
+        for key in ("center_mhz", "sample_rate"):
+            value = settings[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value <= 0:
+                raise ValueError(f"Invalid receiver setting: {key}")
+        if not isinstance(metadata["pointing"], dict):
+            raise ValueError("Invalid observation pointing metadata")
+        if not isinstance(metadata["synthetic"], bool):
+            raise ValueError("Invalid synthetic-data indicator")
+        count = metadata["spectrum_count"]
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ValueError("Invalid observation spectrum count")
+        for key in ("elapsed_integration_s", "effective_integration_s"):
+            value = metadata[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0:
+                raise ValueError(f"Invalid observation timing: {key}")
+        for key in ("started_utc", "saved_utc"):
+            try:
+                stamp = datetime.fromisoformat(metadata[key])
+                if stamp.tzinfo is None or stamp.utcoffset() is None:
+                    raise ValueError("missing timezone")
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid UTC timestamp: {key}") from exc
+        return power, metadata
+
+    @staticmethod
     def read(path):
         with np.load(path, allow_pickle=False) as archive:
             power = archive["power"].copy()
             metadata = json.loads(str(archive["metadata"].item()))
-        if power.ndim != 1 or not np.all(np.isfinite(power)):
-            raise ValueError("Invalid observation power spectrum")
-        if metadata.get("schema_version") != SCHEMA_VERSION:
-            raise ValueError("Unsupported observation schema")
-        return power, metadata
+        return ObservationStore._validate(power, metadata)
 
     def _metadata(self, cfg, integ, pointing, reason, started_utc):
         keys = ("source", "device_index", "center_mhz", "sample_rate", "gain", "ppm",
@@ -80,6 +129,7 @@ class ObservationStore:
         if integ.avg is None or integ.n <= 0:
             return None
         metadata = self._metadata(cfg, integ, pointing, reason, started_utc)
+        self._validate(integ.avg, metadata)
         if checkpoint:
             target = self.checkpoint
         else:

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import math
 import os
+import json
+import tempfile
 
 import numpy as np
 
@@ -46,45 +48,93 @@ class Integrator:
     def _bg_path(self):
         return os.path.join(user_dir(), "background.npz")
 
+    @staticmethod
+    def _check_background(psd, key):
+        arr = np.asarray(psd, dtype=np.float64)
+        if arr.ndim != 1 or arr.size < 2 or not np.all(np.isfinite(arr)) or np.any(arr <= 0):
+            raise ValueError("Background spectrum must contain finite positive power")
+        if not isinstance(key, (tuple, list)) or len(key) < 8:
+            raise ValueError("Background calibration identity is incomplete")
+        if int(key[3]) != arr.size:
+            raise ValueError("Background FFT size does not match the spectrum")
+        return arr
+
+    def _write_background(self, psd, key):
+        # Write/flush/sync/replace: never destroy a previous calibration on a
+        # failed write or partial NPZ update.
+        destination = self._bg_path()
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        fd, temp = tempfile.mkstemp(prefix=".hline-bg-", suffix=".npz", dir=os.path.dirname(destination))
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                np.savez_compressed(stream, bg=psd, key_json=np.array(json.dumps(list(key), allow_nan=False)))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp, destination)
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+
     def capture_background(self, key):
         if self.avg is None:
             return False
-        self.background = self.avg.copy()
-        self.background_key = key
-        try:
-            np.savez(self._bg_path(), bg=self.background, key=np.array(key, dtype=float))
-        except Exception:
-            pass
+        self.set_background(self.avg, key)
         return True
 
     def set_background(self, psd, key):
-        self.background = np.asarray(psd, dtype=np.float64).copy()
+        arr = self._check_background(psd, key)
+        key = tuple(key)
+        self._write_background(arr, key)
+        # Update memory only after a durable save succeeds.
+        self.background = arr.copy()
         self.background_key = key
-        try:
-            np.savez(self._bg_path(), bg=self.background, key=np.array(key, dtype=float))
-        except Exception:
-            pass
 
     def clear_background(self):
-        self.background = None
-        self.background_key = None
         try:
             os.remove(self._bg_path())
-        except Exception:
+        except FileNotFoundError:
             pass
+        # Leave in-memory calibration intact if disk deletion fails.
+        self.background = None
+        self.background_key = None
 
     def _load_background(self):
         try:
-            d = np.load(self._bg_path())
-            self.background = d["bg"]
-            self.background_key = tuple(float(x) for x in d["key"])
-        except Exception:
-            pass
+            with np.load(self._bg_path(), allow_pickle=False) as saved:
+                bg = saved["bg"].copy()
+                if "key_json" in saved:
+                    key = tuple(json.loads(str(saved["key_json"].item())))
+                else:
+                    # Preserve legacy three-field calibrations, but never apply
+                    # them silently as they don't identify source, gain, etc.
+                    key = tuple(float(v) for v in saved["key"])
+            if len(key) >= 8:
+                self._check_background(bg, key)
+            self.background = bg
+            self.background_key = key
+        except FileNotFoundError:
+            return
+        except (ValueError, KeyError, OSError, TypeError, json.JSONDecodeError):
+            # Invalid calibration stays on disk for operator diagnosis.
+            self.background = None
+            self.background_key = None
 
     def background_valid(self, key) -> bool:
-        return (self.background is not None and self.background_key is not None
-                and len(self.background_key) == len(key)
-                and all(abs(a - b) < 1e-6 for a, b in zip(self.background_key, key)))
+        if self.background is None or self.background_key is None:
+            return False
+        if len(self.background_key) != len(key) or len(key) < 8:
+            return False
+        try:
+            self._check_background(self.background, self.background_key)
+        except (ValueError, TypeError):
+            return False
+        for saved, current in zip(self.background_key, key):
+            if isinstance(saved, (int, float)) and not isinstance(saved, bool) and isinstance(current, (int, float)):
+                if not math.isclose(float(saved), float(current), rel_tol=1e-9, abs_tol=1e-6):
+                    return False
+            elif saved != current:
+                return False
+        return True
 
 
 def _smooth(y, n):
@@ -187,6 +237,7 @@ def process(cfg, integ: Integrator, f_mhz: np.ndarray, v_lsr: np.ndarray, bg_ok:
         fallback = True
     else:
         fallback = False
+    baseline_failed = False
 
     # DC spike notch
     bin_hz = float(cfg.get("sample_rate", 2.4e6)) / nfft
@@ -240,12 +291,34 @@ def process(cfg, integ: Integrator, f_mhz: np.ndarray, v_lsr: np.ndarray, bg_ok:
                 mask[-q:] = True
             order = int(cfg.get("baseline_order", 3))
             x = np.linspace(-1, 1, len(v))
-            base = _robust_baseline(x, y, mask, order)
-            y = y / np.maximum(base, 1e-30)
+            # A polynomial constrained by only one band edge can extrapolate
+            # through zero on the other side, producing >1e30% false signals.
+            left = np.count_nonzero(mask[:len(mask)//2])
+            right = np.count_nonzero(mask[len(mask)//2:])
+            valid_fit = left >= max(12, order + 4) and right >= max(12, order + 4)
+            if valid_fit:
+                base = _robust_baseline(x, y, mask, order)
+                # Check the entire fitted band, not only the fit samples.
+                ref = float(np.median(y[mask]))
+                valid_fit = (np.isfinite(ref) and ref > 0 and
+                             np.all(np.isfinite(base)) and
+                             np.min(base) > 0.05 * ref and
+                             np.max(base) < 20.0 * ref)
+            if valid_fit:
+                y = y / base
+            else:
+                # Never label this as a corrected spectrum or detect peaks.
+                fallback = True
+                baseline_failed = True
+                mode = "raw"
+                y = 10 * np.log10(np.maximum(y, 1e-30))
+                y = y - np.median(y)
+                ylabel = "Power (dB, relative) — baseline unavailable"
         else:
             y = y / np.median(y)
-        y = (y - 1.0) * 100.0
-        ylabel = "Signal above background (%)"
+        if mode != "raw":
+            y = (y - 1.0) * 100.0
+            ylabel = "Signal above background (%)"
 
     # smoothing
     dv = abs(v[1] - v[0]) if len(v) > 1 else 1.0
@@ -264,7 +337,7 @@ def process(cfg, integ: Integrator, f_mhz: np.ndarray, v_lsr: np.ndarray, bg_ok:
     # sort ascending velocity for plotting
     order = np.argsort(v)
     return dict(v=v[order], y=y[order], ylabel=ylabel, noise=noise, peaks=peaks,
-                mode=mode, fallback=fallback, spikes=spikes)
+                mode=mode, fallback=fallback, baseline_failed=baseline_failed, spikes=spikes)
 
 
 def _robust_baseline(x, y, mask, order):
@@ -337,7 +410,7 @@ def describe_peaks(l_deg, b_deg, peaks):
     for amp, vel in peaks:
         if abs(vel) < 12:
             # local gas: velocities this small can't be turned into a distance
-            res.append(dict(v=vel, amp=amp, d=[0.6], ambiguous=False, local=True))
+            res.append(dict(v=vel, amp=amp, d=[], ambiguous=False, local=True))
             continue
         ds, amb = astro.distances_for_velocity(l_deg, vel) if abs(b_deg) < 15 else ([], False)
         res.append(dict(v=vel, amp=amp, d=ds, ambiguous=amb, local=False))
