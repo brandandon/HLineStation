@@ -54,11 +54,11 @@ def migration_preflight(source, destination, *, calibration_source=None):
         target = dest / relative
         if target.exists():
             if target.is_file() and sha256(file) == sha256(target):
-                identical.append(str(relative))
+                identical.append(relative.as_posix())
             else:
-                conflicts.append(str(relative))
+                conflicts.append(relative.as_posix())
         else:
-            copies.append(str(relative))
+            copies.append(relative.as_posix())
     return {'copy': copies, 'identical': identical, 'conflicts': conflicts,
             'pending_checkpoint': (src / 'recovery_checkpoint.npz').exists()}
 
@@ -75,7 +75,7 @@ def copy_legacy_observations(source, destination, *, calibration_source=None):
     if plan['conflicts']:
         raise FileExistsError('Conflicting destination files: ' + ', '.join(plan['conflicts']))
     moved = 0
-    sources = {str(rel): file for file, rel in _migration_files(src, calibration_source)}
+    sources = {rel.as_posix(): file for file, rel in _migration_files(src, calibration_source)}
     for relative in plan['copy']:
         source_file = sources[relative]
         target = dest / relative

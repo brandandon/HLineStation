@@ -48,7 +48,7 @@ class Patch05Tests(unittest.TestCase):
             legacy.write_bytes(b'original')
             next_store = ObservationStore.prepare_directory_change(old, Path(td) / 'new')
             self.assertNotEqual(next_store.session_id, old.session_id)
-            self.assertEqual(next_store.root, Path(td) / 'new')
+            self.assertTrue(next_store.root.samefile(Path(td) / 'new'))
             self.assertEqual(legacy.read_bytes(), b'original')
             self.assertIs(ObservationStore.prepare_directory_change(old, old.root), old)
 
@@ -62,7 +62,7 @@ class Patch05Tests(unittest.TestCase):
                 ObservationStore.prepare_directory_change(old, dest)
             # Active acquisition may finish its checkpoint into its original folder.
             candidate = ObservationStore.prepare_directory_change(old, dest, active_segment=True)
-            self.assertEqual(candidate.root, dest)
+            self.assertTrue(candidate.root.samefile(dest))
             old.checkpoint.unlink()
             (dest / 'recovery_checkpoint.npz').write_bytes(b'existing')
             with self.assertRaisesRegex(RuntimeError, 'destination'):
