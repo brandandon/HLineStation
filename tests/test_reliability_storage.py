@@ -16,7 +16,7 @@ class ReliabilityStorageTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.store = ObservationStore(self.temp.name)
         self.cfg = {"source": "simulator", "nfft": 4, "integration_s": 0,
-                    "center_mhz": 1420.40575, "sample_rate": 2400000}
+                    "center_mhz": 1420.40575, "sample_rate": 2400000, "gain": 40.2}
         self.integ = Integrator()
         self.integ.add(np.array([1., 2., 3., 4.]), 0.25, 0)
 

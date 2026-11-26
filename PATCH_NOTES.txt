@@ -1,0 +1,5 @@
+GitHub Actions test fixture fix for Repair Patch 01.
+
+The stricter observation validator now requires receiver gain metadata. Three existing reliability tests constructed a simulator cfg without gain. Add gain: 40.2 to their shared setUp fixture. This does not relax production validation or change scientific observations.
+
+Copy tests/test_reliability_storage.py to the repair branch only.
