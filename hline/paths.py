@@ -23,3 +23,15 @@ def snapshot_dir() -> str:
     d = os.path.join(docs, "HLineStation Snapshots")
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def observation_dir(configured=None) -> str:
+    """User-owned observation directory; user_dir still holds app settings and background.
+
+    This does not migrate or delete legacy data. Use storage_migration explicitly.
+    """
+    from pathlib import Path
+    if configured:
+        return str(Path(configured).expanduser())
+    docs = Path.home() / "Documents"
+    return str(docs / "H-Line Station" / "Observations")

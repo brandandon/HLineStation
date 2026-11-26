@@ -95,7 +95,22 @@ class SettingsDialog(QDialog):
         fl.addRow("FFT size", w["nfft"])
         fl.addRow("", w["bias_tee"])
         fl.addRow("", w["autostart"])
+        w["auto_reconnect"] = QCheckBox("Reconnect automatically after unexpected RTL-SDR interruption")
+        w["auto_reconnect"].setChecked(cfg.get("auto_reconnect", True))
+        w["reconnect_max_attempts"] = QSpinBox()
+        w["reconnect_max_attempts"].setRange(1, 20)
+        w["reconnect_max_attempts"].setValue(int(cfg.get("reconnect_max_attempts", 5)))
+        fl.addRow("", w["auto_reconnect"])
+        fl.addRow("Maximum reconnect attempts", w["reconnect_max_attempts"])
         tabs.addTab(t, "Receiver")
+
+        # storage: changes take effect after restarting the application.
+        t = QWidget(); fl = QFormLayout(t)
+        w["observation_dir"] = QLineEdit(str(cfg.get("observation_dir", "")))
+        w["observation_dir"].setPlaceholderText("Default: Documents/H-Line Station/Observations")
+        fl.addRow("Observation folder", w["observation_dir"])
+        fl.addRow("", QLabel("Existing observations are not moved automatically.\nRestart after changing this folder."))
+        tabs.addTab(t, "Storage")
 
         # processing
         t = QWidget(); fl = QFormLayout(t)

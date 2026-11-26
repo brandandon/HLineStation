@@ -20,6 +20,7 @@ DEFAULTS = {
     "dish_diameter_m": 0.7,
     "beam_deg": 0.0,              # 0 = compute from diameter
     "reset_on_repoint": True,
+    "observation_dir": "",  # blank = Documents/H-Line Station/Observations
 
     # Receiver
     "source": "rtlsdr",           # "rtlsdr" or "simulator"
@@ -32,6 +33,8 @@ DEFAULTS = {
     "nfft": 2048,
     "ffts_per_block": 128,
     "autostart": False,
+    "auto_reconnect": True,      # only for an unexpectedly stopped physical receiver
+    "reconnect_max_attempts": 5, # bounded; operator Stop cancels pending retries
 
     # Processing
     "integration_s": 60.0,        # running average time constant; 0 = average forever

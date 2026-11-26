@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import html
 import os
 import sys
 from datetime import datetime
@@ -16,8 +17,9 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDoubleSpinBox,
 from . import astro, config
 from .config import MODES, beam_width
 from .galaxymap import GalaxyMap
-from .paths import app_dir, snapshot_dir
+from .paths import app_dir, snapshot_dir, observation_dir, user_dir
 from .observations import ObservationStore, utc_stamp
+from .reconnect import retry_delay
 from .processing import Integrator, describe_peaks, process
 from .sdr import RtlSdrThread, SimulatorThread
 from .settings_dialog import SettingsDialog
@@ -85,7 +87,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{APP_NAME} – {self.cfg['site_name']}")
         self.resize(1500, 900)
         self.integ = Integrator()
-        self.observations = ObservationStore()
+        self.observations = ObservationStore(root=observation_dir(self.cfg.get("observation_dir")))
         self.segment_started_utc = utc_stamp()
         self.segment_pointing = {}
         self._last_checkpoint_count = 0
@@ -94,6 +96,13 @@ class MainWindow(QMainWindow):
         self._rx_ended_reason = None
         self._rx_end_unexpected = False
         self._receiver_stop_in_progress = False
+        self._reconnect_attempts = 0
+        self._retry_active = False
+        self._reconnect_timer = QTimer(self)
+        self._reconnect_timer.setSingleShot(True)
+        self._reconnect_timer.timeout.connect(self._run_reconnect)
+        self.last_save = None
+        self.last_save_error = None
         self.dirty = False
         self.last_res = None
         self.state = {}
@@ -162,6 +171,12 @@ class MainWindow(QMainWindow):
         self.tick()
         self.segment_pointing = self._observation_pointing()
         self._check_recovery()
+        legacy_checkpoint = os.path.join(user_dir(), "observations", "recovery_checkpoint.npz")
+        if os.path.isfile(legacy_checkpoint) and os.path.abspath(legacy_checkpoint) != os.path.abspath(str(self.observations.checkpoint)):
+            QMessageBox.warning(self, APP_NAME, "An earlier recovery checkpoint still exists at:\n"
+                                + legacy_checkpoint + "\n\nIt has NOT been migrated or modified. "
+                                "New acquisition is disabled until the checkpoint is recovered safely.")
+            self._recovery_blocked = True
         if self.cfg.get("autostart", True):
             QTimer.singleShot(300, self.start_rx)
         if kiosk:
@@ -290,10 +305,19 @@ class MainWindow(QMainWindow):
         try:
             path = self.observations.save(self.cfg, self.integ, self.segment_pointing,
                                           reason, self.segment_started_utc)
-            self.observations.clear_checkpoint()
+            self.last_save = (utc_stamp(), str(path))
+            self.last_save_error = None
+            try:
+                self.observations.clear_checkpoint()
+            except OSError as exc:
+                # The observation is already durable; warn separately about the checkpoint.
+                self.last_save_error = f"Checkpoint cleanup failed: {exc}"
+                self.statusBar().showMessage(f"Observation saved at {path}; {self.last_save_error}", 15000)
+                return True
             self.statusBar().showMessage(f"Observation saved: {path}", 7000)
             return True
         except Exception as exc:
+            self.last_save_error = str(exc)
             QMessageBox.critical(self, APP_NAME, "Could not save the observation. Averaging will NOT be reset.\n"
                                  f"{type(exc).__name__}: {exc}")
             return False
@@ -333,11 +357,45 @@ class MainWindow(QMainWindow):
             return
         return method(*args)
 
-    def start_rx(self):
+    def _cancel_reconnect(self):
+        self._reconnect_timer.stop()
+        self._retry_active = False
+        self._reconnect_attempts = 0
+
+    def _schedule_reconnect(self):
+        if self.cfg.get("source") != "rtlsdr" or not self.cfg.get("auto_reconnect", True):
+            return False
+        attempt = self._reconnect_attempts + 1
+        delay = retry_delay(attempt, maximum=int(self.cfg.get("reconnect_max_attempts", 5)))
+        if delay is None:
+            self.statusBar().showMessage("RTL-SDR reconnect attempts exhausted; start manually", 0)
+            return False
+        self._reconnect_attempts = attempt
+        self._retry_active = True
+        self.statusBar().showMessage(
+            f"RTL-SDR interrupted; attempt {attempt} in {delay}s. Stop cancels retry.", 0)
+        self._reconnect_timer.start(delay * 1000)
+        return True
+
+    def _run_reconnect(self):
+        if not self._retry_active:
+            return
+        if self.rx is not None or getattr(self, "_recovery_blocked", False):
+            self._cancel_reconnect()
+            return
+        # Do not reset the retry count. A subsequent early failure consumes
+        # another attempt. Only sustained acquisition resets this counter.
+        self._retry_active = False
+        self.start_rx(retry=True)
+
+    def start_rx(self, retry=False):
+        if not retry:
+            self._cancel_reconnect()
         if getattr(self, "_recovery_blocked", False):
             return False
-        if not self.stop_rx():
-            return False
+        if self.rx is not None:
+            if not self.stop_rx():
+                return False
         if not self._reset_segment("receiver_restart"):
             return False
         self.rx_error = ""
@@ -370,6 +428,8 @@ class MainWindow(QMainWindow):
         return True
 
     def stop_rx(self):
+        # An operator stop or settings change must cancel all queued retries.
+        self._cancel_reconnect()
         if self.rx is not None:
             self._receiver_stop_in_progress = True
             self.rx.stop()
@@ -397,6 +457,12 @@ class MainWindow(QMainWindow):
         return True
 
     def toggle_rx(self):
+        if self._reconnect_timer.isActive():
+            self._cancel_reconnect()
+            self.statusBar().showMessage("Automatic reconnection canceled by operator", 10000)
+            self.act_rx.setChecked(False)
+            self.act_rx.setText("▶ Start")
+            return
         if self.rx is not None and self.rx.isRunning():
             # Do not conceal a failed save with a false "Stopped" message.
             self.stop_rx()  # _save_segment owns success/failure messaging.
@@ -418,8 +484,9 @@ class MainWindow(QMainWindow):
         unexpected = self._rx_end_unexpected or reason != "operator_stop"
         self._rx_ended_reason = None
         self._rx_end_unexpected = False
+        has_observation = self.integ.avg is not None
         if not self._save_segment("receiver_interrupted" if unexpected else "receiver_finished"):
-            self.statusBar().showMessage("Receiver stopped; unsaved observation retained for recovery", 15000)
+            self.statusBar().showMessage("Receiver stopped; unsaved observation retained for recovery; retry disabled", 0)
             return
         self.integ.reset()
         self.segment_started_utc = utc_stamp()
@@ -428,9 +495,12 @@ class MainWindow(QMainWindow):
         self.dirty = True
         # Invalidate callbacks still queued from this completed worker.
         self._rx_generation += 1
-        if unexpected:
-            self.statusBar().showMessage("Receiver stopped unexpectedly; observation saved. Restart manually.", 15000)
         self.rx = None
+        if unexpected:
+            if not self._schedule_reconnect():
+                self.statusBar().showMessage(
+                    "Receiver interrupted; " + ("observation saved; " if has_observation else "no observation acquired; ")
+                    + "restart manually or check reconnect settings", 0)
 
     def on_spectrum(self, p, dt):
         # Never average a spectrum against different FFT metadata.  Refuse
@@ -447,15 +517,19 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Rejected spectrum: observation FFT shape changed unexpectedly", 12000)
             return
         self.integ.add(p, dt, float(self.cfg["integration_s"]))
+        # A continuously acquiring receiver is considered recovered. An early
+        # disconnect still counts towards the bounded retry limit.
+        if self._reconnect_attempts and self.integ.t_total >= 30.0:
+            self._reconnect_attempts = 0
         self.dirty = True
 
     def on_status(self, msg, err):
         if err:
             self.rx_error = msg
             self.statusBar().showMessage(msg)
-            if not self.kiosk:
-                QMessageBox.warning(self, APP_NAME, msg + "\n\nTip: Settings → Receiver → Source lets you run "
-                                    "the Simulator for a demo without hardware.")
+            if not self.kiosk and (self.cfg.get("source") != "rtlsdr" or not self.cfg.get("auto_reconnect", True)):
+                QMessageBox.warning(self, APP_NAME, msg + "\n\nCheck the USB connection and receiver driver. "
+                                    "Restart manually when the device is ready.")
         else:
             self.rx_error = ""
             self.statusBar().showMessage(msg)
@@ -785,6 +859,9 @@ class MainWindow(QMainWindow):
 <div>{rx_txt}</div>
 <div>{float(c['center_mhz']):.4f} MHz · {float(c['sample_rate'])/1e6:.2f} MS/s · gain {c['gain']}{' · bias-tee' if c['bias_tee'] and c['source']=='rtlsdr' else ''}</div>
 <div>Averaged: <b>{t_int:.0f} s</b> ({self.integ.n} blocks){' · background ✓' if self.integ.background_valid(self._bg_key()) else ''}</div>
+<div style='{lab}'>Acquired samples: {self.integ.t_total:.1f} s · averaging constant: {float(c['integration_s']):.0f} s</div>
+<div style='{lab}'>Last saved: {html.escape(self.last_save[0] + ' · ' + self.last_save[1]) if self.last_save else 'not yet'}
+{' · WARNING: ' + html.escape(self.last_save_error) if self.last_save_error else ''}</div>
 </div>"""
         if self.kiosk:
             html = f"""
@@ -834,6 +911,7 @@ class MainWindow(QMainWindow):
         self.caption.setText(f"<div style='font-size:{14*scale}pt'>" + "<br>".join(lines) + "</div>")
 
     def closeEvent(self, ev):
+        self._cancel_reconnect()
         if not self.stop_rx():
             ev.ignore()
             return

@@ -14,7 +14,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .paths import user_dir
+from .paths import observation_dir
+from .config import beam_width
 
 SCHEMA_VERSION = 1
 
@@ -25,7 +26,7 @@ def utc_stamp():
 
 class ObservationStore:
     def __init__(self, root=None):
-        self.root = Path(root) if root is not None else Path(user_dir()) / "observations"
+        self.root = Path(root) if root is not None else Path(observation_dir())
         self.root.mkdir(parents=True, exist_ok=True)
         self.checkpoint = self.root / "recovery_checkpoint.npz"
         self.session_id = uuid.uuid4().hex
@@ -123,6 +124,20 @@ class ObservationStore:
             "power_units": "linear relative power spectral density (uncalibrated)",
             "processing": "unprocessed averaged PSD; no background, baseline, RFI replacement or smoothing",
             "frequency_axis": "center_mhz + (bin - nfft/2) * sample_rate_hz / nfft / 1e6",
+            "acquisition_timing": {
+                "acquired_sample_duration_s": float(integ.t_total),
+                "wall_clock_duration_s": max(0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(started_utc)).total_seconds()),
+                "averaging_time_constant_s": float(cfg.get("integration_s", 0)),
+                "effective_integration_is_estimate": True,
+            },
+            "beam_metadata": {
+                "beam_width_deg": beam_width(cfg),
+                "beam_width_method": "configured" if float(cfg.get("beam_deg") or 0) > 0 else "approx_70_lambda_over_D",
+                "beam_width_configured_deg": float(cfg.get("beam_deg") or 0),
+            },
+            "pointing_reference_utc": utc_stamp(),
+            "pointing_reference_frame": "ICRS/J2000 approximate; az/el input",
+            "velocity_reference_frame": "receiver topocentric (processing may apply optional LSR correction)",
         }
 
     def save(self, cfg, integ, pointing, reason, started_utc, *, checkpoint=False):
