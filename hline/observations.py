@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .paths import observation_dir
+from .paths import observation_dir, user_dir
 from .config import beam_width
 
 SCHEMA_VERSION = 1
@@ -124,7 +124,9 @@ class ObservationStore:
             "identity": list(key),
             "spectrum_sha256": hashlib.sha256(arr.tobytes()).hexdigest(),
             "spectrum_bins": int(arr.size),
-            "note": "Calibration fingerprint only; original background file must be retained for full reprocessing",
+            "calibration_id": getattr(integ, "background_calibration_id", None),
+            "archived_relative_path": ("calibrations/" + str(integ.background_calibration_id) + ".npz") if getattr(integ, "background_calibration_id", None) else None,
+            "note": "Immutable calibration archived when available; display application to this segment is not asserted",
         }
 
     def _metadata(self, cfg, integ, pointing, reason, started_utc):
@@ -148,6 +150,8 @@ class ObservationStore:
                 "wall_clock_duration_s": max(0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(started_utc)).total_seconds()),
                 "averaging_time_constant_s": float(cfg.get("integration_s", 0)),
                 "effective_integration_is_estimate": True,
+                "effective_independent_blocks_estimate": float(integ.effective_independent_blocks()) if hasattr(integ, 'effective_independent_blocks') else None,
+                "effective_duration_not_true_radiometer_exposure": True,
             },
             "beam_metadata": {
                 "beam_width_deg": beam_width(cfg),
@@ -157,6 +161,8 @@ class ObservationStore:
             "pointing_reference_utc": started_utc,
             "pointing_reference_frame": "ICRS/J2000 approximate; az/el input",
             "pointing_reference_note": "Snapshot at segment start, not time-averaged beam track",
+            "pointing_measurement_method": "operator-entered azimuth/elevation; no pointing encoder verification",
+            "coordinate_calculation_note": "Derived sky coordinates are approximate; full time-series sky drift/Doppler provenance not recorded",
             "processing_provenance": {
                 "raw_saved_spectrum": "unprocessed averaged linear PSD",
                 "view_mode_at_save": cfg.get("mode"),
@@ -170,11 +176,46 @@ class ObservationStore:
             "velocity_reference_frame": "receiver topocentric (processing may apply optional LSR correction)",
         }
 
+    def _preserve_calibration(self, integ):
+        """Keep referenced immutable calibration alongside exported observations.
+
+        Never modify a calibration archive and never invent an archive reference
+        for synthetic/injected test backgrounds that were not durably captured.
+        """
+        cid = getattr(integ, 'background_calibration_id', None)
+        if not cid:
+            return
+        origin = Path(user_dir()) / 'calibrations' / f'{cid}.npz'
+        if not origin.is_file():
+            raise FileNotFoundError(f'Referenced background calibration not found: {cid}')
+        import shutil
+        target_dir = self.root / 'calibrations'
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / origin.name
+        src_hash = hashlib.sha256(origin.read_bytes()).digest()
+        if target.exists():
+            if hashlib.sha256(target.read_bytes()).digest() != src_hash:
+                raise ValueError(f'Conflicting calibration archive: {target}')
+            return
+        fd, temp = tempfile.mkstemp(prefix='.hline-cal-', suffix='.tmp', dir=target_dir)
+        try:
+            with os.fdopen(fd, 'wb') as output, open(origin, 'rb') as inp:
+                shutil.copyfileobj(inp, output)
+                output.flush()
+                os.fsync(output.fileno())
+            if hashlib.sha256(Path(temp).read_bytes()).digest() != src_hash:
+                raise OSError('Calibration reference copy did not verify')
+            os.link(temp, target)  # create only; never overwrite another archive
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+
     def save(self, cfg, integ, pointing, reason, started_utc, *, checkpoint=False):
         if integ.avg is None or integ.n <= 0:
             return None
         metadata = self._metadata(cfg, integ, pointing, reason, started_utc)
         self._validate(integ.avg, metadata)
+        self._preserve_calibration(integ)
         if checkpoint:
             target = self.checkpoint
         else:

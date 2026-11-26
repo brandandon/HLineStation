@@ -5,6 +5,9 @@ import math
 import os
 import json
 import tempfile
+import hashlib
+from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 
@@ -17,6 +20,7 @@ class Integrator:
         self.reset()
         self.background = None
         self.background_key = None
+        self.background_calibration_id = None
         self._load_background()
 
     # ------------------------------------------------------------ averaging
@@ -24,6 +28,7 @@ class Integrator:
         self.avg = None
         self.t_total = 0.0
         self.n = 0
+        self._weight_square_sum = 0.0
 
     def add(self, p: np.ndarray, dt: float, tau: float):
         p = np.asarray(p, dtype=np.float64)
@@ -31,6 +36,7 @@ class Integrator:
             self.avg = p.copy()
             self.t_total = dt
             self.n = 1
+            self._weight_square_sum = 1.0
             return
         self.n += 1
         self.t_total += dt
@@ -38,8 +44,15 @@ class Integrator:
             a = 1.0 - math.exp(-dt / tau)
             a = max(a, 1.0 / self.n)          # plain mean until we've filled tau
             self.avg += a * (p - self.avg)
+            self._weight_square_sum = (1-a)**2 * self._weight_square_sum + a*a
         else:
-            self.avg += (p - self.avg) / self.n
+            a = 1.0 / self.n
+            self.avg += a * (p - self.avg)
+            self._weight_square_sum = (1-a)**2 * self._weight_square_sum + a*a
+
+    def effective_independent_blocks(self) -> float:
+        """Weight-based sample count; not an actual integration duration or SNR."""
+        return 1.0 / self._weight_square_sum if self.n and self._weight_square_sum > 0 else 0.0
 
     def effective_time(self, tau: float) -> float:
         return min(self.t_total, tau) if tau and tau > 0 else self.t_total
@@ -47,6 +60,47 @@ class Integrator:
     # ----------------------------------------------------------- background
     def _bg_path(self):
         return os.path.join(user_dir(), "background.npz")
+
+    @staticmethod
+    def _calibration_id(psd, key):
+        """Content address covers both raw power and receiver identity."""
+        arr = np.asarray(psd, dtype='<f8')
+        identity = json.dumps(list(key), separators=(',', ':'), allow_nan=False).encode('utf-8')
+        return hashlib.sha256(identity + b'\0' + arr.tobytes()).hexdigest()
+
+    def _catalog_path(self, calibration_id):
+        return Path(user_dir()) / 'calibrations' / f'{calibration_id}.npz'
+
+    def _archive_background(self, arr, key):
+        """Preserve an immutable, independently verifiable reference spectrum."""
+        cid = self._calibration_id(arr, key)
+        target = self._catalog_path(cid)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            with np.load(target, allow_pickle=False) as saved:
+                previous = self._check_background(saved['bg'], json.loads(str(saved['key_json'].item())))
+                if self._calibration_id(previous, json.loads(str(saved['key_json'].item()))) != cid:
+                    raise ValueError('Existing calibration archive checksum mismatch')
+            return cid
+        fd, tmp = tempfile.mkstemp(prefix='.hline-catalog-', suffix='.tmp', dir=target.parent)
+        try:
+            with os.fdopen(fd, 'wb') as stream:
+                np.savez_compressed(stream, bg=arr, key_json=np.array(json.dumps(list(key), allow_nan=False)),
+                                    captured_utc=np.array(datetime.now(timezone.utc).isoformat()))
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Exclusive creation prevents replacement of existing immutable entries.
+            os.link(tmp, target)
+        except FileExistsError:
+            with np.load(target, allow_pickle=False) as saved:
+                previous = self._check_background(saved['bg'], json.loads(str(saved['key_json'].item())))
+                if self._calibration_id(previous, json.loads(str(saved['key_json'].item()))) != cid:
+                    raise ValueError('Conflicting immutable calibration archive')
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        return cid
+
 
     @staticmethod
     def _check_background(psd, key):
@@ -84,10 +138,14 @@ class Integrator:
     def set_background(self, psd, key):
         arr = self._check_background(psd, key)
         key = tuple(key)
+        # First archive the full reference spectrum; the active-file write then
+        # switches the preferred calibration without replacing its history.
+        calibration_id = self._archive_background(arr, key)
         self._write_background(arr, key)
         # Update memory only after a durable save succeeds.
         self.background = arr.copy()
         self.background_key = key
+        self.background_calibration_id = calibration_id
 
     def clear_background(self):
         try:
@@ -97,6 +155,7 @@ class Integrator:
         # Leave in-memory calibration intact if disk deletion fails.
         self.background = None
         self.background_key = None
+        self.background_calibration_id = None
 
     def _load_background(self):
         try:
@@ -112,12 +171,23 @@ class Integrator:
                 self._check_background(bg, key)
             self.background = bg
             self.background_key = key
+            # Existing Patch 01-03 backgrounds predate the immutable catalog.
+            # Archive them on first load; do not advertise a missing archive.
+            self.background_calibration_id = None
+            if len(key) >= 8:
+                try:
+                    self.background_calibration_id = self._archive_background(bg, key)
+                except (OSError, ValueError):
+                    # Existing active calibration remains readable, but its
+                    # provenance explicitly has no durable archive reference.
+                    self.background_calibration_id = None
         except FileNotFoundError:
             return
         except (ValueError, KeyError, OSError, TypeError, json.JSONDecodeError):
             # Invalid calibration stays on disk for operator diagnosis.
             self.background = None
             self.background_key = None
+            self.background_calibration_id = None
 
     def background_valid(self, key) -> bool:
         if self.background is None or self.background_key is None:
@@ -239,10 +309,14 @@ def process(cfg, integ: Integrator, f_mhz: np.ndarray, v_lsr: np.ndarray, bg_ok:
         fallback = False
     baseline_failed = False
 
+    # A true raw display must not notch, mask spikes, smooth, normalize to the
+    # median, or substitute a calibration. The saved raw PSD is never changed.
+    truly_raw = mode == 'raw'
+
     # DC spike notch
     bin_hz = float(cfg.get("sample_rate", 2.4e6)) / nfft
     w_dc = max(1, int(round(3500.0 / bin_hz)))   # ~ +-3.5 kHz around the centre
-    if cfg.get("dc_notch", True):
+    if cfg.get("dc_notch", True) and not truly_raw:
         c = nfft // 2
         w = w_dc
         lo, hi = c - w - 1, c + w + 1
@@ -251,7 +325,7 @@ def process(cfg, integ: Integrator, f_mhz: np.ndarray, v_lsr: np.ndarray, bg_ok:
     # usable part of the band
     frac = float(cfg.get("band_use_fraction", 0.84)) if mode != "sdr" else 0.98
     keep = int(nfft * frac / 2)
-    sl = slice(nfft // 2 - keep, nfft // 2 + keep)
+    sl = slice(0, nfft) if truly_raw else slice(nfft // 2 - keep, nfft // 2 + keep)
     v = v_lsr[sl]
     y = p[sl]
     # The baseline region is fixed in *receiver* frequency (topocentric velocity), so
@@ -267,14 +341,13 @@ def process(cfg, integ: Integrator, f_mhz: np.ndarray, v_lsr: np.ndarray, bg_ok:
         y = y / np.maximum(bg[sl], 1e-30)
 
     spikes = []
-    if cfg.get("remove_spikes", True):
+    if cfg.get("remove_spikes", True) and not truly_raw:
         y, spikes = remove_spikes(v, y, float(cfg.get("spike_max_kms", 5.0)))
 
     ylabel = ""
     if mode == "raw":
         y = 10 * np.log10(np.maximum(y, 1e-30))
-        y = y - np.median(y)
-        ylabel = "Power (dB, relative)"
+        ylabel = "Raw averaged power (dB, uncorrected)"
     elif mode == "sdr":
         # like SDR#'s IF Average: absolute dB with the receiver's shape left in
         # normalised so the level doesn't change with FFT size (Hann window: sum(w^2) = 0.375 N)
@@ -291,28 +364,19 @@ def process(cfg, integ: Integrator, f_mhz: np.ndarray, v_lsr: np.ndarray, bg_ok:
                 mask[-q:] = True
             order = int(cfg.get("baseline_order", 3))
             x = np.linspace(-1, 1, len(v))
-            # A polynomial constrained by only one band edge can extrapolate
-            # through zero on the other side, producing >1e30% false signals.
-            left = np.count_nonzero(mask[:len(mask)//2])
-            right = np.count_nonzero(mask[len(mask)//2:])
-            valid_fit = left >= max(12, order + 4) and right >= max(12, order + 4)
-            if valid_fit:
-                base = _robust_baseline(x, y, mask, order)
-                # Check the entire fitted band, not only the fit samples.
-                ref = float(np.median(y[mask]))
-                valid_fit = (np.isfinite(ref) and ref > 0 and
-                             np.all(np.isfinite(base)) and
-                             np.min(base) > 0.05 * ref and
-                             np.max(base) < 20.0 * ref)
+            # Fit log(power): all candidate model baselines are strictly
+            # positive. Reject one-sided coverage and implausible extrapolation.
+            base, fit_diagnostics = _positive_baseline(x, y, mask, order)
+            valid_fit = base is not None
             if valid_fit:
                 y = y / base
             else:
-                # Never label this as a corrected spectrum or detect peaks.
+                # Any failed quality gate returns uncorrected power and cannot
+                # trigger hydrogen cloud detection.
                 fallback = True
                 baseline_failed = True
                 mode = "raw"
                 y = 10 * np.log10(np.maximum(y, 1e-30))
-                y = y - np.median(y)
                 ylabel = "Power (dB, relative) — baseline unavailable"
         else:
             y = y / np.median(y)
@@ -322,7 +386,8 @@ def process(cfg, integ: Integrator, f_mhz: np.ndarray, v_lsr: np.ndarray, bg_ok:
 
     # smoothing
     dv = abs(v[1] - v[0]) if len(v) > 1 else 1.0
-    y = _smooth(y, max(1, round(float(cfg.get("smooth_kms", 3)) / dv)))
+    if not truly_raw:
+        y = _smooth(y, max(1, round(float(cfg.get("smooth_kms", 3)) / dv)))
 
     # noise estimate from line-free region
     win = float(cfg.get("line_window_kms", 160))
@@ -338,6 +403,70 @@ def process(cfg, integ: Integrator, f_mhz: np.ndarray, v_lsr: np.ndarray, bg_ok:
     order = np.argsort(v)
     return dict(v=v[order], y=y[order], ylabel=ylabel, noise=noise, peaks=peaks,
                 mode=mode, fallback=fallback, baseline_failed=baseline_failed, spikes=spikes)
+
+
+def _positive_baseline(x, y, mask, requested_order):
+    """Fit a bounded positive continuum with symmetric frequency coverage.
+
+    Candidate orders from low to high are evaluated in log(power). The fit is
+    strictly positive but *not* guaranteed astrophysically correct: weak and
+    blended lines can bias continuum selection. Quality checks reject highly
+    unstable solutions, leaving the caller's safe raw fallback in place.
+    """
+    mask = np.asarray(mask, bool)
+    y = np.asarray(y, float)
+    if len(y) < 24 or not np.all(np.isfinite(y)) or np.any(y <= 0):
+        return None, {'reason': 'nonpositive_or_invalid_power'}
+    n = len(y)
+    left = np.count_nonzero(mask[:n//2])
+    right = np.count_nonzero(mask[n//2:])
+    if left < 12 or right < 12:
+        return None, {'reason': 'insufficient_two_sided_coverage'}
+    scale = float(np.median(y[mask]))
+    if not np.isfinite(scale) or scale <= 0:
+        return None, {'reason': 'invalid_reference_power'}
+    logy = np.log(y / scale)
+    chosen = None
+    # Prefer the requested polynomial if it passes. For a failed higher order
+    # fit, back down to a simpler model rather than extrapolate through zero.
+    for order in range(min(3, max(0, int(requested_order))), -1, -1):
+        fitted = None
+        points = mask.copy()
+        if np.count_nonzero(points) < max(30, 5 * (order + 1)):
+            continue
+        for _ in range(5):
+            try:
+                with np.errstate(all='raise'):
+                    coef = np.polyfit(x[points], logy[points], order)
+                    fitted = np.polyval(coef, x)
+            except (ValueError, FloatingPointError, np.linalg.LinAlgError):
+                break
+            residual = logy - fitted
+            med = float(np.median(residual[points]))
+            sigma = max(1.4826 * float(np.median(np.abs(residual[points] - med))), 1e-5)
+            new_points = mask & (np.abs(residual - med) < max(3 * sigma, 0.025))
+            if np.count_nonzero(new_points) < max(30, 5 * (order + 1)):
+                break
+            if np.array_equal(new_points, points):
+                break
+            points = new_points
+        else:
+            pass
+        if fitted is None:
+            continue
+        if not np.all(np.isfinite(fitted)) or np.max(np.abs(fitted)) > np.log(20):
+            continue
+        base = scale * np.exp(fitted)
+        if np.min(base) < 0.05 * scale or np.max(base) > 20 * scale:
+            continue
+        fit_residual = logy[mask] - fitted[mask]
+        fit_mad = 1.4826 * float(np.median(np.abs(fit_residual - np.median(fit_residual))))
+        # A continuum error greater than 35% in log power is not meaningful.
+        if not np.isfinite(fit_mad) or fit_mad > 0.35:
+            continue
+        chosen = (base, {'order': order, 'fit_log_mad': fit_mad, 'reason':'ok'})
+        break
+    return chosen if chosen is not None else (None, {'reason':'no_stable_positive_fit'})
 
 
 def _robust_baseline(x, y, mask, order):

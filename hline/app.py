@@ -20,6 +20,7 @@ from .galaxymap import GalaxyMap
 from .paths import app_dir, snapshot_dir, observation_dir, user_dir
 from .observations import ObservationStore, utc_stamp
 from .recovery import preserve_checkpoint
+from .receiver_events import is_current_event
 from .reconnect import retry_delay
 from .processing import Integrator, describe_peaks, process
 from .sdr import RtlSdrThread, SimulatorThread
@@ -358,7 +359,7 @@ class MainWindow(QMainWindow):
 
     def _receiver_event(self, generation, method, *args):
         """Ignore queued Qt signals from a superseded or stopped receiver."""
-        if generation != self._rx_generation or self.rx is None:
+        if not is_current_event(generation, self._rx_generation, self.rx is not None):
             return
         return method(*args)
 

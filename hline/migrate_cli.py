@@ -13,7 +13,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .storage_migration import copy_legacy_observations, sha256
+from .storage_migration import copy_legacy_observations, migration_preflight
 
 
 def migration_preview(source, destination):
@@ -22,21 +22,14 @@ def migration_preview(source, destination):
         raise FileNotFoundError(src)
     if src == dest or src in dest.parents or dest in src.parents:
         raise ValueError('Source and destination directories must not overlap')
-    files = sorted(src.glob('*.npz'))
-    checkpoint = src / 'recovery_checkpoint.npz'
-    copies, identical, conflicts = [], [], []
-    for path in files:
-        if path.name == checkpoint.name:
-            continue
-        target = dest / path.name
-        if target.exists():
-            (identical if target.is_file() and sha256(path) == sha256(target) else conflicts).append(path.name)
-        else:
-            copies.append(path.name)
+    plan = migration_preflight(src, dest)
+    # This summary is compatible with the preview-only CLI used in Patch 03.
     return {'source': str(src), 'destination': str(dest),
-            'copy': copies, 'identical': identical, 'conflicts': conflicts,
-            'pending_checkpoint': checkpoint.exists(),
-            'total_source_observations': len(files) - int(checkpoint.exists())}
+            'copy': plan['copy'], 'identical': plan['identical'],
+            'conflicts': plan['conflicts'], 'pending_checkpoint': plan['pending_checkpoint'],
+            'total_source_observations': len(list(src.glob('*.npz'))) - int(plan['pending_checkpoint']),
+            'recovery_sidecars': len(list(src.glob('*.recovery.json'))),
+            'calibration_archives': len(list((src/'calibrations').glob('*.npz'))) if (src/'calibrations').is_dir() else 0}
 
 
 def main(argv=None):

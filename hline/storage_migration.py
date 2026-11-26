@@ -15,47 +15,66 @@ def sha256(path):
     return h.hexdigest()
 
 
-def copy_legacy_observations(source, destination):
-    """Copy-only migration. No deletion, overwriting or checkpoint auto-resume.
+def _migration_files(source):
+    """Observation containers, recovery sidecars and immutable calibration refs."""
+    src = Path(source)
+    listed = [p for p in src.glob('*.npz') if p.name != 'recovery_checkpoint.npz']
+    listed.extend(src.glob('*.recovery.json'))
+    catalog = src / 'calibrations'
+    if catalog.is_dir():
+        listed.extend(catalog.glob('*.npz'))
+    return sorted(listed)
 
-    Existing destination entries must match byte-for-byte, otherwise abort.
-    Call only from an explicit operator-approved migration action.
-    """
-    src = Path(source).resolve()
-    dest = Path(destination).resolve()
+
+def migration_preflight(source, destination):
+    """Scan all conflicts before the first file can be published."""
+    src, dest = Path(source).resolve(), Path(destination).resolve()
     if not src.is_dir():
         raise FileNotFoundError(src)
-    if dest == src or src in dest.parents or dest in src.parents:
-        raise ValueError("Migration directories must not overlap")
-    dest.mkdir(parents=True, exist_ok=True)
-    moved = 0
-    for source_file in sorted(src.glob("*.npz")):
-        # A recovery checkpoint is active data, not merely an archived observation.
-        # Do not copy it into the new active checkpoint location.
-        if source_file.name == "recovery_checkpoint.npz":
-            continue
-        target = dest / source_file.name
+    if src == dest or src in dest.parents or dest in src.parents:
+        raise ValueError('Migration directories must not overlap')
+    copies, identical, conflicts = [], [], []
+    for file in _migration_files(src):
+        relative = file.relative_to(src)
+        target = dest / relative
         if target.exists():
-            if sha256(source_file) != sha256(target):
-                raise FileExistsError(f"Conflicting destination observation: {target}")
-            continue
-        fd, temp = tempfile.mkstemp(prefix=".hline-migrate-", suffix=".tmp", dir=dest)
+            if target.is_file() and sha256(file) == sha256(target):
+                identical.append(str(relative))
+            else:
+                conflicts.append(str(relative))
+        else:
+            copies.append(str(relative))
+    return {'copy': copies, 'identical': identical, 'conflicts': conflicts,
+            'pending_checkpoint': (src / 'recovery_checkpoint.npz').exists()}
+
+
+def copy_legacy_observations(source, destination):
+    """Copy-only migration; preflight all conflicts, include recovery sidecars.
+
+    No file is overwritten or deleted. The CLI independently blocks an active
+    checkpoint; direct helper calls exclude it to preserve legacy behavior.
+    An interrupted copy can be safely rerun and verified.
+    """
+    src, dest = Path(source).resolve(), Path(destination).resolve()
+    plan = migration_preflight(src, dest)
+    if plan['conflicts']:
+        raise FileExistsError('Conflicting destination files: ' + ', '.join(plan['conflicts']))
+    moved = 0
+    for relative in plan['copy']:
+        source_file = src / relative
+        target = dest / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp = tempfile.mkstemp(prefix='.hline-migrate-', suffix='.tmp', dir=target.parent)
         try:
-            with os.fdopen(fd, "wb") as output, open(source_file, "rb") as inp:
+            with os.fdopen(fd, 'wb') as output, open(source_file, 'rb') as inp:
                 shutil.copyfileobj(inp, output)
                 output.flush()
                 os.fsync(output.fileno())
             if sha256(source_file) != sha256(temp):
-                raise IOError(f"Migration copy checksum mismatch: {source_file.name}")
-            # Atomic publish, never overwrite an existing file.
-            try:
-                os.link(temp, target)
-            except FileExistsError:
-                raise
-            except OSError:
-                # Hard links may be unavailable; refuse rather than risk overwrite.
-                raise RuntimeError("Filesystem cannot safely publish a non-overwriting migration file")
+                raise IOError(f'Migration copy checksum mismatch: {relative}')
+            os.link(temp, target)  # exclusive publication, no overwrite
             moved += 1
         finally:
-            if os.path.exists(temp): os.unlink(temp)
+            if os.path.exists(temp):
+                os.unlink(temp)
     return moved
