@@ -1,0 +1,1 @@
+Patch 02 CI correction: tests/test_patch02.py only. Replaces the Unix-specific /tmp/example assertion with an operating-system-native temporary directory. Production application code is unchanged. Copy tests/test_patch02.py into the stage1-consolidated-repairs repository, commit and push.

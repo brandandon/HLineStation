@@ -20,7 +20,8 @@ class Patch02Tests(unittest.TestCase):
 
     def test_documents_default_and_override(self):
         self.assertTrue(observation_dir().endswith(str(Path('H-Line Station')/'Observations')))
-        self.assertEqual(observation_dir('/tmp/example'), '/tmp/example')
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            self.assertEqual(observation_dir(temporary_directory), str(Path(temporary_directory)))
 
     def test_migration_copy_preserves_original_and_recovery(self):
         with tempfile.TemporaryDirectory() as tmp:
