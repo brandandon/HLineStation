@@ -6,6 +6,7 @@ Synthetic data is explicitly labelled; no background/RFI processing is applied h
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import tempfile
 import uuid
@@ -108,6 +109,24 @@ class ObservationStore:
             metadata = json.loads(str(archive["metadata"].item()))
         return ObservationStore._validate(power, metadata)
 
+    @staticmethod
+    def _background_provenance(integ):
+        """Describe the calibration available at save time; do not claim it was applied."""
+        bg = getattr(integ, "background", None)
+        key = getattr(integ, "background_key", None)
+        if bg is None or key is None:
+            return {"available": False}
+        arr = np.asarray(bg, dtype="<f8")
+        if arr.ndim != 1 or not np.all(np.isfinite(arr)):
+            return {"available": False, "warning": "invalid background array"}
+        return {
+            "available": True,
+            "identity": list(key),
+            "spectrum_sha256": hashlib.sha256(arr.tobytes()).hexdigest(),
+            "spectrum_bins": int(arr.size),
+            "note": "Calibration fingerprint only; original background file must be retained for full reprocessing",
+        }
+
     def _metadata(self, cfg, integ, pointing, reason, started_utc):
         keys = ("source", "device_index", "center_mhz", "sample_rate", "gain", "ppm",
                 "bias_tee", "nfft", "ffts_per_block", "integration_s", "mode",
@@ -135,8 +154,19 @@ class ObservationStore:
                 "beam_width_method": "configured" if float(cfg.get("beam_deg") or 0) > 0 else "approx_70_lambda_over_D",
                 "beam_width_configured_deg": float(cfg.get("beam_deg") or 0),
             },
-            "pointing_reference_utc": utc_stamp(),
+            "pointing_reference_utc": started_utc,
             "pointing_reference_frame": "ICRS/J2000 approximate; az/el input",
+            "pointing_reference_note": "Snapshot at segment start, not time-averaged beam track",
+            "processing_provenance": {
+                "raw_saved_spectrum": "unprocessed averaged linear PSD",
+                "view_mode_at_save": cfg.get("mode"),
+                "processing_settings": {k: cfg.get(k) for k in (
+                    "baseline_order", "line_window_kms", "band_use_fraction",
+                    "dc_notch", "smooth_kms", "remove_spikes", "spike_max_kms",
+                    "peak_sigma", "show_peaks", "auto_bg_offset_mhz",
+                    "auto_bg_seconds")},
+                "background_calibration": self._background_provenance(integ),
+            },
             "velocity_reference_frame": "receiver topocentric (processing may apply optional LSR correction)",
         }
 

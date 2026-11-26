@@ -19,6 +19,7 @@ from .config import MODES, beam_width
 from .galaxymap import GalaxyMap
 from .paths import app_dir, snapshot_dir, observation_dir, user_dir
 from .observations import ObservationStore, utc_stamp
+from .recovery import preserve_checkpoint
 from .reconnect import retry_delay
 from .processing import Integrator, describe_peaks, process
 from .sdr import RtlSdrThread, SimulatorThread
@@ -283,17 +284,21 @@ class MainWindow(QMainWindow):
                      f"{metadata.get('spectrum_count', 0)} spectra; " \
                      f"{metadata.get('elapsed_integration_s', 0):.1f} s integration."
         except Exception as exc:
-            QMessageBox.warning(self, APP_NAME, f"A recovery file exists but could not be read:\n{exc}\n{path}")
+            # Never start a new acquisition while an unreadable checkpoint
+            # could be overwritten by a fresh periodic checkpoint.
+            self._recovery_blocked = True
+            QMessageBox.warning(self, APP_NAME, f"A recovery file exists but could not be read:\n{exc}\n{path}\n\n"
+                                "Acquisition is blocked to protect the checkpoint. Back it up and resolve the problem first.")
             return
         QMessageBox.information(self, APP_NAME, "A previous observation checkpoint was found.\n"
                                 + detail + "\n\nThe checkpoint has been preserved at:\n" + str(path)
                                 + "\nIt will not be deleted or overwritten during this session.")
-        # Preserve the previous session's checkpoint before new checkpoints begin.
-        recovered = self.observations.root / f"recovered_{metadata.get('session_id', 'unknown')[:12]}.npz"
-        if recovered.exists():
-            recovered = self.observations.root / f"recovered_{utc_stamp().replace(':', '-')}.npz"
+        # Preserve the original bytes and record recovery provenance separately.
         try:
-            os.replace(path, recovered)
+            recovered, warning = preserve_checkpoint(path, metadata)
+            self.statusBar().showMessage(f"Recovered checkpoint preserved: {recovered}", 12000)
+            if warning:
+                QMessageBox.warning(self, APP_NAME, warning)
         except OSError as exc:
             QMessageBox.warning(self, APP_NAME, f"Cannot protect the recovery checkpoint: {exc}\n"
                                 "New acquisition is disabled until this is resolved.")
