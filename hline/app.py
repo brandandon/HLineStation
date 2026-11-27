@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-import html
+import html as html_utils
 import os
 import sys
 from datetime import datetime
@@ -898,8 +898,8 @@ class MainWindow(QMainWindow):
 <div>{float(c['center_mhz']):.4f} MHz · {float(c['sample_rate'])/1e6:.2f} MS/s · gain {c['gain']}{' · bias-tee' if c['bias_tee'] and c['source']=='rtlsdr' else ''}</div>
 <div>Averaged: <b>{t_int:.0f} s</b> ({self.integ.n} blocks){' · background ✓' if self.integ.background_valid(self._bg_key()) else ''}</div>
 <div style='{lab}'>Acquired samples: {self.integ.t_total:.1f} s · averaging constant: {float(c['integration_s']):.0f} s</div>
-<div style='{lab}'>Last saved: {html.escape(self.last_save[0] + ' · ' + self.last_save[1]) if self.last_save else 'not yet'}
-{' · WARNING: ' + html.escape(self.last_save_error) if self.last_save_error else ''}</div>
+<div style='{lab}'>Last saved: {html_utils.escape(self.last_save[0] + ' · ' + self.last_save[1]) if self.last_save else 'not yet'}
+{' · WARNING: ' + html_utils.escape(self.last_save_error) if self.last_save_error else ''}</div>
 </div>"""
         if self.kiosk:
             html = f"""
